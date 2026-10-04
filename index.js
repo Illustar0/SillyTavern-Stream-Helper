@@ -15,6 +15,9 @@ let countColor = loadCountColor();
 let buttonPosition = loadButtonPosition();
 let history = [];
 let panelOpen = false;
+let refreshFrame = null;
+const pendingRecordUpdates = new Set();
+const recordViews = new Map();
 // Requests, responses, and their metadata stay in memory for the current page only.
 const sessionRaw = new Map();
 
@@ -252,13 +255,15 @@ function rawEntry(record) {
     return sessionRaw.get(record.localId);
 }
 
+/** Append received text only while the record is retained. */
 function appendRawResponse(record, text) {
     if (!text) return;
-    rawEntry(record).responseChunks.push(text);
+    sessionRaw.get(record.localId)?.responseChunks.push(text);
 }
 
+/** Read retained response text without recreating cleared raw data. */
 function getRawResponse(record) {
-    return rawEntry(record).responseChunks.join('');
+    return sessionRaw.get(record.localId)?.responseChunks.join('') || '';
 }
 
 function firstString(...values) {
@@ -457,6 +462,8 @@ async function inspectResponseBody(record, response) {
             appendRawResponse(record, decoded);
             parserState.buffer += decoded;
             drainSseBlocks(record, parserState);
+            if (parserState.sawSse) record.detectedResponseFormat = 'sse';
+            scheduleRecordUpdate(record);
             if (done) break;
         }
     } catch (error) {
@@ -481,7 +488,9 @@ async function inspectResponseBody(record, response) {
     return { format, readError };
 }
 
+/** Finalize retained records immediately; cleared requests must not reappear. */
 function finishRecord(record, state = 'complete') {
+    if (!history.includes(record)) return;
     record.finishedAt = new Date().toISOString();
     record.state = state;
     history = [record, ...history.filter(item => item.localId !== record.localId)];
@@ -503,6 +512,7 @@ async function inspectResponse(record, response, signal, removeAbortListener) {
         record.httpStatus = response.status;
         record.responseHeaders = readAllowedHeaders(response);
         record.responseContentType = response.headers.get('content-type') || null;
+        scheduleRecordUpdate(record);
 
         const { format, readError } = await inspectResponseBody(record, response);
         record.detectedResponseFormat = format;
@@ -665,19 +675,27 @@ async function copyText(text) {
     if (!copied) throw new Error('浏览器拒绝了剪贴板操作');
 }
 
+/** Change a text node only when its displayed value differs. */
+function updateText(element, text) {
+    if (element.textContent !== text) element.textContent = text;
+}
+
+/** Create a copy action that reads raw text only when clicked. */
 function makeCopyButton(label, textProvider, unavailableReason) {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'stsh-copy-button';
     button.textContent = label;
-    const initialText = textProvider();
-    button.disabled = typeof initialText !== 'string';
-    if (button.disabled && unavailableReason) button.title = unavailableReason;
+    button.dataset.copyLabel = label;
+    button.dataset.unavailableReason = unavailableReason;
+    button.disabled = true;
+    button.title = unavailableReason;
 
     button.addEventListener('click', async () => {
+        if (button.dataset.copyFeedback) return;
         const text = textProvider();
         if (typeof text !== 'string') return;
-        const originalLabel = button.textContent;
+        button.dataset.copyFeedback = 'true';
         try {
             await copyText(text);
             button.textContent = '已复制';
@@ -685,24 +703,25 @@ function makeCopyButton(label, textProvider, unavailableReason) {
             console.error('[酒馆流式助手] 复制失败。', error);
             button.textContent = '复制失败';
         }
-        setTimeout(() => { button.textContent = originalLabel; }, 1400);
+        setTimeout(() => {
+            delete button.dataset.copyFeedback;
+            updateText(button, button.dataset.copyLabel);
+        }, 1400);
     });
 
     return button;
 }
 
-function buildRecordCard(record) {
-    const card = document.createElement('article');
-    card.className = 'stsh-card';
-    const verdict = verdictFor(record);
+/** Refresh copy availability without overwriting temporary copy feedback. */
+function updateCopyButton(button, available) {
+    button.disabled = !available;
+    button.title = available ? '' : button.dataset.unavailableReason;
+    if (!button.dataset.copyFeedback) updateText(button, button.dataset.copyLabel);
+}
 
-    const header = document.createElement('div');
-    header.className = 'stsh-card-header';
-    addText(header, 'stsh-time', formatTime(record.startedAt));
-    addText(header, `stsh-status stsh-status-${verdict.key}`, verdict.label);
-    card.append(header);
-
-    const rows = [
+/** Describe fixed card fields; empty optional values remain hidden. */
+function recordRows(record) {
+    return [
         ['请求模型', record.requestedModel || '未读取到'],
         ['正文分片报告', countText(record.contentModelCounts)],
         ['全部分片报告', countText(record.streamModelCounts)],
@@ -710,49 +729,90 @@ function buildRecordCard(record) {
         ['回复 ID', record.responseId || '未报告'],
         ['事件数 / 解析错误', `${record.eventCount} / ${record.parseErrors}`],
         ['响应格式', record.detectedResponseFormat || '未确定'],
+        ['Content-Type', record.responseContentType || ''],
+        ['计费来源', record.usageSource || ''],
+        ['系统指纹', record.systemFingerprint || ''],
+        ['响应头', Object.entries(record.responseHeaders || {}).map(([key, value]) => `${key}: ${value}`).join('；')],
+        ['错误', record.error || ''],
     ];
+}
 
-    if (record.responseContentType) rows.push(['Content-Type', record.responseContentType]);
-    if (record.usageSource) rows.push(['计费来源', record.usageSource]);
-    if (record.systemFingerprint) rows.push(['系统指纹', record.systemFingerprint]);
-    if (Object.keys(record.responseHeaders || {}).length) {
-        rows.push(['响应头', Object.entries(record.responseHeaders).map(([key, value]) => `${key}: ${value}`).join('；')]);
-    }
-    if (record.error) rows.push(['错误', record.error]);
+/** Build persistent card nodes and retain references for local updates. */
+function buildRecordCard(record) {
+    const card = document.createElement('article');
+    card.className = 'stsh-card';
+    const header = document.createElement('div');
+    header.className = 'stsh-card-header';
+    addText(header, 'stsh-time', formatTime(record.startedAt));
+    const status = addText(header, 'stsh-status', '');
+    card.append(header);
 
     const table = document.createElement('dl');
     table.className = 'stsh-rows';
-    for (const [label, value] of rows) {
+    const rows = new Map();
+    for (const [label] of recordRows(record)) {
         const dt = document.createElement('dt');
         dt.textContent = label;
         const dd = document.createElement('dd');
-        dd.textContent = value;
+        rows.set(label, { dt, dd });
         table.append(dt, dd);
     }
     card.append(table);
 
-    const raw = sessionRaw.get(record.localId);
+    const requestButton = makeCopyButton(
+        '复制完整原始输入',
+        () => sessionRaw.get(record.localId)?.request ?? null,
+        '完整输入仅保留在生成发生的当前页面；刷新后不可恢复。',
+    );
+    const replyButton = makeCopyButton(
+        '复制当前原始回复',
+        () => sessionRaw.get(record.localId)?.responseChunks.length ? getRawResponse(record) : null,
+        '尚未收到任何响应内容，或内容已随页面刷新清除。',
+    );
     const copyActions = document.createElement('div');
     copyActions.className = 'stsh-copy-actions';
-    const replyButtonLabel = record.state === 'aborted'
+    copyActions.append(requestButton, replyButton);
+    card.append(copyActions);
+    return { card, status, rows, requestButton, replyButton };
+}
+
+/** Update only the existing nodes belonging to one record. */
+function updateRecordCard(record, view) {
+    const verdict = verdictFor(record);
+    const statusClass = `stsh-status stsh-status-${verdict.key}`;
+    if (view.status.className !== statusClass) view.status.className = statusClass;
+    updateText(view.status, verdict.label);
+    for (const [label, value] of recordRows(record)) {
+        const { dt, dd } = view.rows.get(label);
+        dt.hidden = dd.hidden = !value;
+        updateText(dd, value);
+    }
+
+    const raw = sessionRaw.get(record.localId);
+    updateCopyButton(view.requestButton, typeof raw?.request === 'string');
+    view.replyButton.dataset.copyLabel = record.state === 'aborted'
         ? '复制已接收原始回复'
         : record.state === 'running'
             ? '复制当前原始回复'
             : '复制完整原始回复';
-    copyActions.append(
-        makeCopyButton(
-            '复制完整原始输入',
-            () => raw?.request ?? null,
-            '完整输入仅保留在生成发生的当前页面；刷新后不可恢复。',
-        ),
-        makeCopyButton(
-            replyButtonLabel,
-            () => raw?.responseChunks?.length ? getRawResponse(record) : null,
-            '尚未收到任何响应内容，或内容已随页面刷新清除。',
-        ),
-    );
-    card.append(copyActions);
-    return card;
+    updateCopyButton(view.replyButton, Boolean(raw?.responseChunks.length));
+}
+
+/** Coalesce received chunks into one card update per browser frame, without polling. */
+function scheduleRecordUpdate(record) {
+    if (!panelOpen || document.hidden || !recordViews.has(record.localId)) return;
+    pendingRecordUpdates.add(record);
+    if (refreshFrame !== null) return;
+    refreshFrame = requestAnimationFrame(() => {
+        refreshFrame = null;
+        if (panelOpen && !document.hidden) {
+            for (const pendingRecord of pendingRecordUpdates) {
+                const view = recordViews.get(pendingRecord.localId);
+                if (view) updateRecordCard(pendingRecord, view);
+            }
+        }
+        pendingRecordUpdates.clear();
+    });
 }
 
 function ensureUi() {
@@ -770,6 +830,7 @@ function ensureUi() {
     panel.setAttribute('aria-label', '酒馆流式助手');
 
     document.body.append(button, panel);
+    buildPanelContents(button, panel);
     installButtonDrag(button);
     applyButtonPosition(button);
 }
@@ -783,17 +844,8 @@ function downloadHistory() {
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
 }
 
-function render() {
-    ensureUi();
-    const button = document.getElementById(`${EXTENSION_ID}-button`);
-    const panel = document.getElementById(`${EXTENSION_ID}-panel`);
-    if (!button || !panel) return;
-
-    applyCountColor(button);
-    button.querySelector('.stsh-button-count').textContent = String(history.length);
-    panel.classList.toggle('stsh-open', panelOpen);
-    panel.replaceChildren();
-
+/** Create the panel controls once so streaming never interrupts user input. */
+function buildPanelContents(button, panel) {
     const heading = document.createElement('header');
     heading.className = 'stsh-panel-header';
     const titleWrap = document.createElement('div');
@@ -827,6 +879,7 @@ function render() {
     retentionInput.setAttribute('aria-label', '自动保留的记录数量');
     retentionInput.addEventListener('change', () => {
         historyLimit = normalizeHistoryLimit(retentionInput.value, historyLimit);
+        retentionInput.value = String(historyLimit);
         saveSettings();
         applyRetentionLimit();
         render();
@@ -885,13 +938,13 @@ function render() {
 
     const exportButton = document.createElement('button');
     exportButton.type = 'button';
+    exportButton.className = 'stsh-export-history';
     exportButton.textContent = '导出 JSON';
-    exportButton.disabled = history.length === 0;
     exportButton.addEventListener('click', downloadHistory);
     const clearButton = document.createElement('button');
     clearButton.type = 'button';
+    clearButton.className = 'stsh-clear-history';
     clearButton.textContent = '清空记录';
-    clearButton.disabled = history.length === 0;
     clearButton.addEventListener('click', () => {
         if (!confirm('清空酒馆流式助手的本地记录？')) return;
         history = [];
@@ -902,13 +955,53 @@ function render() {
 
     const list = document.createElement('div');
     list.className = 'stsh-list';
-    if (history.length === 0) {
-        addText(list, 'stsh-empty', '尚无记录。下一次聊天补全请求会自动出现在这里。');
-    } else {
-        history.forEach(record => list.append(buildRecordCard(record)));
-    }
-
     panel.append(heading, actions, list);
+}
+
+/** Reconcile cards by local ID without replacing the list or its scroll position. */
+function syncRecordList(list) {
+    const retainedIds = new Set(history.map(record => record.localId));
+    for (const [localId, view] of recordViews) {
+        if (retainedIds.has(localId)) continue;
+        view.card.remove();
+        recordViews.delete(localId);
+    }
+    if (!panelOpen || document.hidden) return;
+
+    const empty = list.querySelector('.stsh-empty');
+    if (history.length === 0) {
+        if (!empty) addText(list, 'stsh-empty', '尚无记录。下一次聊天补全请求会自动出现在这里。');
+        return;
+    }
+    empty?.remove();
+    let nextCard = list.firstElementChild;
+    for (const record of history) {
+        let view = recordViews.get(record.localId);
+        if (!view) {
+            view = buildRecordCard(record);
+            recordViews.set(record.localId, view);
+        }
+        updateRecordCard(record, view);
+        if (view.card !== nextCard) list.insertBefore(view.card, nextCard);
+        nextCard = view.card.nextElementSibling;
+    }
+}
+
+/** Synchronize structural changes immediately while preserving the panel skeleton. */
+function render() {
+    ensureUi();
+    if (refreshFrame !== null) cancelAnimationFrame(refreshFrame);
+    refreshFrame = null;
+    pendingRecordUpdates.clear();
+
+    const button = document.getElementById(`${EXTENSION_ID}-button`);
+    const panel = document.getElementById(`${EXTENSION_ID}-panel`);
+    applyCountColor(button);
+    updateText(button.querySelector('.stsh-button-count'), String(history.length));
+    panel.classList.toggle('stsh-open', panelOpen);
+    panel.querySelector('.stsh-export-history').disabled = history.length === 0;
+    panel.querySelector('.stsh-clear-history').disabled = history.length === 0;
+    syncRecordList(panel.querySelector('.stsh-list'));
 }
 
 function init() {
@@ -916,6 +1009,7 @@ function init() {
     applyRetentionLimit();
     saveSettings();
     installFetchObserver();
+    document.addEventListener('visibilitychange', render);
     render();
     console.info('[酒馆流式助手] 已启用；请求记录、完整输入与原始回复仅在当前页面内存中临时保存。');
 }
